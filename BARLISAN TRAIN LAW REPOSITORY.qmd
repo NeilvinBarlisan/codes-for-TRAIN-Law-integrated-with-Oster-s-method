@@ -1,0 +1,617 @@
+---
+title: "Appendix: R Code for TRAIN Law Analysis"
+format: pdf
+editor: source
+warning: false
+---
+
+# Appendix: R Code
+
+## A.1 Data Loading
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(scales)
+library(broom)
+
+# Load raw FIES volumes (two-volume structure per year)
+v1_2012 <- fread("fies_2012_vol.1.csv")
+v2_2012 <- fread("fies_2012_vol.2.csv")
+
+v1_2015 <- fread("fies_2015_vol.1.csv")
+v2_2015 <- fread("fies_2015_vol.2.csv")
+
+v1_2018 <- fread("fies_2018_vol.1.csv")
+v2_2018 <- fread("fies_2018_vol.2.csv")
+```
+
+---
+
+## A.2 Merging Volumes and Deduplication Checks
+
+### 2012
+
+```{r}
+keys_2012 <- c("W_REGN", "W_OID", "W_SHSN", "W_HCN")
+
+# Check for duplicates in each volume
+nrow(v1_2012[, .N, by = keys_2012][N > 1])
+nrow(v2_2012[, .N, by = keys_2012][N > 1])
+
+# Merge volumes: drop overlapping non-key columns from vol.2
+setkeyv(v1_2012, keys_2012)
+setkeyv(v2_2012, keys_2012)
+v2_2012_clean <- v2_2012[, !setdiff(intersect(names(v1_2012), names(v2_2012)), keys_2012),
+                          with = FALSE]
+fies_2012 <- v1_2012[v2_2012_clean]
+
+# Validate merge
+nrow(v1_2012); nrow(fies_2012)
+fies_2012[, .N, by = keys_2012][N > 1]
+all.equal(v1_2012$RFACT, fies_2012$RFACT)
+```
+
+### 2015
+
+```{r}
+keys_2015 <- c("W_REGN", "W_ID", "W_SHSN", "W_HCN")
+
+nrow(v1_2015[, .N, by = keys_2015][N > 1])
+nrow(v2_2015[, .N, by = keys_2015][N > 1])
+
+setkeyv(v1_2015, keys_2015)
+setkeyv(v2_2015, keys_2015)
+v2_2015_clean <- v2_2015[, !setdiff(intersect(names(v1_2015), names(v2_2015)), keys_2015),
+                          with = FALSE]
+fies_2015 <- v1_2015[v2_2015_clean]
+
+nrow(v1_2015); nrow(fies_2015)
+fies_2015[, .N, by = keys_2015][N > 1]
+all.equal(v1_2015$RFACT, fies_2015$RFACT)
+```
+
+### 2018
+
+```{r}
+keys_2018 <- c("W_REGN", "W_PROV", "SEQUENCE_NO")
+
+nrow(v1_2018[, .N, by = keys_2018][N > 1])
+nrow(v2_2018[, .N, by = keys_2018][N > 1])
+
+setkeyv(v1_2018, keys_2018)
+setkeyv(v2_2018, keys_2018)
+v2_2018_clean <- v2_2018[, !setdiff(intersect(names(v1_2018), names(v2_2018)), keys_2018),
+                          with = FALSE]
+fies_2018 <- v1_2018[v2_2018_clean]
+
+nrow(v1_2018); nrow(fies_2018)
+fies_2018[, .N, by = keys_2018][N > 1]
+all.equal(v1_2018$RFACT, fies_2018$RFACT)
+```
+
+---
+
+## A.3 Region 10 Datasets and Stacking
+
+```{r}
+# Load pre-processed Region 10 files
+fies_12 <- read_csv("fies_2012_combined.csv") %>%
+  rename(TOTEX = T_TOTEX, FOOD = T_FOOD,
+         NFOOD = T_NFOOD, TRANSPORT = T_TRANSPORT) %>%
+  mutate(year = 2012)
+
+fies_15 <- read_csv("fies_2015_combined.csv") %>%
+  mutate(post = 0, year = 2015)
+
+fies_18 <- read_csv("fies_2018_combined.csv") %>%
+  mutate(post = 1, year = 2018)
+
+# Stack all three years
+combined <- bind_rows(fies_12, fies_15, fies_18)
+```
+
+---
+
+## A.4 Variable Construction
+
+### Treatment Variable
+
+```{r}
+# Transport exposure thresholds are defined using 2015 baseline distribution
+base_2015 <- combined %>%
+  filter(year == 2015)
+
+q1 <- quantile(base_2015$TRANSPORT, 0.10, na.rm = TRUE)  # low-exposure cutoff
+q3 <- quantile(base_2015$TRANSPORT, 0.90, na.rm = TRUE)  # high-exposure cutoff
+
+# treat: Binary indicator based on 2015 transport expenditure percentiles
+# 1 = high exposure (top 10%); 0 = low exposure (bottom 10%)
+# Middle 80% excluded from DiD sample
+```
+
+### Post-Intervention Indicator
+
+```{r}
+# post: Binary time indicator
+# 0 = 2015 (pre-TRAIN Law); 1 = 2018 (post-TRAIN Law)
+```
+
+### Outcome Variable
+
+```{r}
+# log_totex: Natural log of total household expenditure (TOTEX)
+# Log transformation applied to reduce skewness and allow percentage interpretation
+```
+
+### Control Variables
+
+```{r}
+# FSIZE : Household size
+# AGE   : Age of household head
+# URB   : Urban/rural indicator (1 = urban, 0 = rural)
+# RFACT : Survey expansion weight (used as regression weight)
+```
+
+### Construct DiD Dataset
+
+```{r}
+did_data <- combined %>%
+  filter(year %in% c(2015, 2018)) %>%
+  mutate(
+    treat = case_when(
+      TRANSPORT >= q3 ~ 1,
+      TRANSPORT <= q1 ~ 0,
+      TRUE            ~ NA_real_
+    ),
+    post      = if_else(year == 2018, 1, 0),
+    log_totex = log(TOTEX)
+  ) %>%
+  filter(!is.na(treat))
+
+table(did_data$year)
+table(did_data$treat, did_data$post)
+```
+
+---
+
+## A.5 Difference-in-Differences Model
+
+```{r}
+did_model <- lm(
+  log_totex ~ treat * post + FSIZE + AGE + URB,
+  data    = did_data,
+  weights = RFACT
+)
+summary(did_model)
+```
+
+---
+
+## A.6 DiD Plot
+
+```{r}
+# Weighted group means
+trend_data <- did_data %>%
+  filter(!is.na(log_totex), !is.na(treat), !is.na(RFACT)) %>%
+  group_by(year, treat) %>%
+  summarise(mean_log_totex = weighted.mean(log_totex, w = RFACT, na.rm = TRUE),
+            .groups = "drop")
+
+# Counterfactual for treated group
+low_2015  <- trend_data %>% filter(year == 2015, treat == 0) %>% pull(mean_log_totex)
+low_2018  <- trend_data %>% filter(year == 2018, treat == 0) %>% pull(mean_log_totex)
+high_2015 <- trend_data %>% filter(year == 2015, treat == 1) %>% pull(mean_log_totex)
+high_2018 <- trend_data %>% filter(year == 2018, treat == 1) %>% pull(mean_log_totex)
+
+cf_high_2018 <- high_2015 + (low_2018 - low_2015)
+
+cf_line <- data.frame(
+  year           = c(2015, 2018),
+  mean_log_totex = c(high_2015, cf_high_2018)
+)
+```
+
+```{r, echo=FALSE}
+train_did_plot <- ggplot(
+  trend_data,
+  aes(x = year, y = mean_log_totex,
+      color = factor(treat), group = factor(treat))
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_line(data = cf_line,
+            aes(x = year, y = mean_log_totex),
+            inherit.aes = FALSE,
+            linetype = "dashed", color = "black", linewidth = 1) +
+  geom_segment(x = 2018, xend = 2018,
+               y = high_2018, yend = cf_high_2018,
+               color = "#FF69B4", linewidth = 1.2) +
+  scale_color_manual(values = c("0" = "#E07B6A", "1" = "#5B9BD5"),
+                     labels = c("Low exposure", "High exposure")) +
+  scale_x_continuous(breaks = c(2012, 2015, 2018)) +
+  labs(
+    title = "Log Total Expenditure Trends of High and Low Exposure Groups",
+    x     = "Year",
+    y     = "Weighted Mean log Total Expenditure",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 15, hjust = 0),
+    axis.title         = element_text(size = 15, face = "bold"),
+    axis.text          = element_text(size = 15),
+    legend.title       = element_text(face = "bold", size = 15),
+    legend.text        = element_text(size = 15),
+    panel.grid.major   = element_line(color = "gray90", linewidth = 0.4),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(15, 20, 15, 15)
+  )
+
+ggsave("did_plot_train_final.png", plot = train_did_plot,
+       width = 8, height = 5, dpi = 300, bg = "white")
+train_did_plot
+```
+
+---
+
+## A.7 Parallel Trends Assumption Tests
+
+### A.7.1 Pre-Trend Regression Test (2012–2015)
+
+```{r}
+# Apply 2015-defined thresholds to 2012 and 2015 data
+pretrend_data <- combined %>%
+  filter(year %in% c(2012, 2015)) %>%
+  mutate(
+    treat = case_when(
+      TRANSPORT >= q3 ~ 1,
+      TRANSPORT <= q1 ~ 0,
+      TRUE            ~ NA_real_
+    ),
+    log_totex = log(TOTEX),
+    pre       = if_else(year == 2015, 1, 0)
+  ) %>%
+  filter(!is.na(treat))
+
+table(pretrend_data$year)
+table(pretrend_data$treat, pretrend_data$year)
+```
+
+```{r}
+pretrend_model <- lm(
+  log_totex ~ treat * pre + FSIZE + AGE + URB,
+  data    = pretrend_data,
+  weights = RFACT
+)
+summary(pretrend_model)
+```
+
+### Pre-Trend Plot
+
+```{r, echo=FALSE}
+pretrend_plot_data <- pretrend_data %>%
+  group_by(year, treat) %>%
+  summarise(mean_log_totex = weighted.mean(log_totex, RFACT, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(group = if_else(treat == 1,
+                         "High transport exposure",
+                         "Low transport exposure"))
+
+train_pretrend_plot <- ggplot(pretrend_plot_data,
+       aes(x = year, y = mean_log_totex,
+           color = group, group = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = c(2012, 2015)) +
+  labs(
+    title = "Pre-Trend Check (2012\u20132015)",
+    x     = "Year",
+    y     = "Weighted Mean of Log Total Expenditure",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15, hjust = 0),
+    axis.title       = element_text(size = 15, face = "bold"),
+    axis.text        = element_text(size = 15),
+    legend.title     = element_text(face = "bold", size = 15),
+    legend.text      = element_text(size = 15),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(15, 20, 15, 15)
+  )
+
+ggsave("pretrend_plot_train.png", plot = train_pretrend_plot,
+       width = 8, height = 5, dpi = 300, bg = "white")
+train_pretrend_plot
+```
+
+### A.7.2 Placebo Test
+
+```{r}
+# Placebo DiD using only pre-treatment years (2012 vs. 2015)
+# A significant interaction here would undermine parallel trends
+placebo_model <- lm(
+  log_totex ~ treat * pre + FSIZE + AGE + URB,
+  data    = pretrend_data,
+  weights = RFACT
+)
+summary(placebo_model)
+```
+
+---
+
+## A.8 Event Study
+
+```{r}
+# All three survey years; 2015 as reference year (last pre-treatment period)
+combined_es <- combined %>%
+  filter(year %in% c(2012, 2015, 2018)) %>%
+  mutate(
+    treat     = case_when(
+      TRANSPORT >= q3 ~ 1,
+      TRANSPORT <= q1 ~ 0,
+      TRUE            ~ NA_real_
+    ),
+    log_totex = log(TOTEX),
+    year      = relevel(factor(year), ref = "2015")
+  ) %>%
+  filter(!is.na(treat))
+
+event_model <- lm(
+  log_totex ~ treat * year + FSIZE + AGE + URB,
+  data    = combined_es,
+  weights = RFACT
+)
+summary(event_model)
+```
+
+### Event Study Plot
+
+```{r, echo=FALSE}
+event_results <- tidy(event_model) %>%
+  filter(grepl("treat:year", term)) %>%
+  mutate(
+    year    = c(2012, 2018),
+    ci_low  = estimate - 1.96 * std.error,
+    ci_high = estimate + 1.96 * std.error
+  )
+
+train_event_study_plot <- ggplot(event_results,
+       aes(x = year, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 0.4, linewidth = 0.9) +
+  geom_point(size = 3) +
+  # Reference year point
+  annotate("point", x = 2015, y = 0, size = 3, shape = 21,
+           fill = "white", color = "gray50", stroke = 1.2) +
+  annotate("text", x = 2015, y = -0.005,
+           label = "Reference\n(2015)", vjust = 1.4,
+           size = 3.5, color = "gray50", fontface = "italic") +
+  scale_x_continuous(breaks = c(2012, 2015, 2018)) +
+  labs(
+    title = "Event Study: Effect of TRAIN Law on Total Expenditure",
+    x     = "Year",
+    y     = "Treatment Effect on log Total Expenditure"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15, hjust = 0),
+    axis.title       = element_text(size = 15, face = "bold"),
+    axis.text        = element_text(size = 15),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(15, 20, 15, 15)
+  )
+
+ggsave("event_study_train.png", plot = train_event_study_plot,
+       width = 8, height = 5, dpi = 300, bg = "white")
+train_event_study_plot
+```
+
+
+
+# -------------------------
+# OSTER DELTA METHOD
+# TRAIN Law: Effect on Log Total Expenditure
+# -------------------------
+
+# Step 1: Short regression (no covariates) - beta_dot and R_dot
+# Treatment variable is the high/low transport exposure indicator
+
+```{r}
+short_model <- lm(
+  log_totex ~ treat*post,
+  data = did_data,
+  weights = RFACT
+)
+```
+
+# Step 2: Controlled regression (with covariates) - beta_tilde and R_tilde
+# Same covariates as did_model, WITHOUT post and interaction
+# Oster's method assesses robustness of the treat coefficient
+# in the cross-sectional relationship
+
+```{r}
+controlled_model <- lm(
+  log_totex ~ treat*post + FSIZE + AGE + URB,
+  data = did_data,
+  weights = RFACT
+)
+```
+
+
+# Step 3: Extract values
+
+```{r}
+beta_dot   <- coef(short_model)["treat:post"]
+beta_tilde <- coef(controlled_model)["treat:post"]
+R_dot      <- summary(short_model)$r.squared
+R_tilde    <- summary(controlled_model)$r.squared
+
+cat("beta_dot (uncontrolled):", round(beta_dot, 4), "\n")
+cat("beta_tilde (controlled):", round(beta_tilde, 4), "\n")
+cat("R_dot:", round(R_dot, 4), "\n")
+cat("R_tilde:", round(R_tilde, 4), "\n")
+```
+
+# -------------------------
+# Step 4: Define Rmax values
+# Oster (2019) benchmark: Rmax = min($\pi$ * R_tilde, 1)
+# -------------------------
+
+# Range of Rmax values to evaluate
+
+```{r}
+
+pi_values  <- seq(1.0, 2.0, by = 0.1)
+Rmax_range <- pmin(pi_values * R_tilde, 1)
+
+delta_star_values <- beta_tilde * (R_tilde - R_dot) /
+                     ((beta_dot - beta_tilde) * (Rmax_range - R_tilde))
+
+sensitivity_table <- tibble(
+  Pi            = pi_values,
+  Rmax          = round(Rmax_range, 4),
+  Delta_star    = round(delta_star_values, 4),
+  Robust        = ifelse(abs(delta_star_values) > 1,
+                         "Robust (|δ̃*| > 1)",
+                         "Fragile (|δ̃*| ≤ 1)")
+)
+
+print(sensitivity_table, n = Inf)
+```
+
+
+
+```{r}
+Rmax_benchmark <- min(1.3 * R_tilde, 1)
+
+cat("\nRmax (1.3 * R_tilde):", round(Rmax_benchmark, 4), "\n")
+```
+
+# -------------------------
+# Step 5: Oster delta formula (delta_tilde = 1 case)
+# Solving for delta that sets beta* = 0:
+# delta = [beta_tilde / (beta_dot - beta_tilde)] *
+#         [(R_tilde - R_dot) / (Rmax - R_tilde)]
+# -------------------------
+
+
+```{r}
+oster_delta <- function(beta_dot, beta_tilde, R_dot, R_tilde, Rmax_benchmark) {
+  numerator   <- beta_tilde * (R_tilde - R_dot)
+  denominator <- (beta_dot - beta_tilde) * (Rmax_benchmark - R_tilde)
+  delta       <- numerator / denominator
+  return(delta)
+}
+
+delta_benchmark <- oster_delta(beta_dot, beta_tilde,
+                               R_dot, R_tilde, Rmax_benchmark)
+
+cat("\n--- Oster Delta Results ---\n")
+cat("Delta (Rmax = 1.3 * R_tilde =",
+    round(Rmax_benchmark, 4), "):",
+    round(delta_benchmark, 4), "\n")
+```
+
+
+
+# -------------------------
+# Step 6: Bias-adjusted beta* (identified set)
+# beta* = beta_tilde - delta_tilde *
+#         (beta_dot - beta_tilde) * (Rmax - R_tilde) / (R_tilde - R_dot)
+# With delta_tilde = 1 (Oster's recommended bound)
+# -------------------------
+
+
+```{r}
+bias_adjusted_beta <- function(beta_dot, beta_tilde,
+                               R_dot, R_tilde,
+                               Rmax_benchmark, delta_tilde = 1) {
+  adjustment <- delta_tilde *
+    (beta_dot - beta_tilde) *
+    (Rmax_benchmark - R_tilde) /
+    (R_tilde - R_dot)
+  beta_star  <- beta_tilde - adjustment
+  return(beta_star)
+}
+
+beta_star_benchmark <- bias_adjusted_beta(beta_dot, beta_tilde,
+                                          R_dot, R_tilde,
+                                          Rmax_benchmark)
+
+cat("\n--- Bias-Adjusted Beta* (delta_tilde = 1) ---\n")
+cat("beta* (Rmax = 1.3 * R_tilde):",
+    round(beta_star_benchmark, 4), "\n")
+```
+
+# -------------------------
+# Step 7: Identified set
+# [beta_tilde, beta*(Rmax, delta_tilde = 1)]
+# -------------------------
+
+
+```{r}
+cat("\n--- Identified Set [beta_tilde, beta*] ---\n")
+cat("Rmax = 1.3 * R_tilde: [",
+    round(beta_tilde, 4), ",",
+    round(beta_star_benchmark, 4), "]\n")
+```
+
+# -------------------------
+# Step 8: Robustness interpretation
+# Robust if identified set excludes zero AND delta >= 1
+# -------------------------
+
+```{r}
+cat("\n--- Robustness Assessment ---\n")
+```
+
+
+# Benchmark
+
+```{r}
+if (delta_benchmark >= 1) {
+  cat("Rmax = 1.3*R_tilde: delta =",
+      round(delta_benchmark, 4),
+      "-- ROBUST (unobservables must be >= as important as",
+      "observables to explain away effect)\n")
+} else {
+  cat("Rmax = 1.3*R_tilde: delta =",
+      round(delta_benchmark, 4),
+      "-- NOT ROBUST (relatively small unobservable selection",
+      "suffices to nullify effect)\n")
+}
+```
+
+
+# Check if identified set includes zero
+
+```{r}
+sets <- list(
+  benchmark = c(beta_tilde, beta_star_benchmark)
+)
+
+for (nm in names(sets)) {
+  lb <- min(sets[[nm]])
+  ub <- max(sets[[nm]])
+  if (lb <= 0 & ub >= 0) {
+    cat("Identified set (", nm,
+        "): INCLUDES zero -- effect not robust",
+        "to omitted variable bias\n")
+  } else {
+    cat("Identified set (", nm,
+        "): EXCLUDES zero -- effect survives",
+        "omitted variable bias test\n")
+  }
+}
+```
+
+
+
+
